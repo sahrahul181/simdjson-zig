@@ -21,7 +21,9 @@ A high-performance, zero-allocation, SIMD-accelerated JSON parsing engine implem
 | **DOM Full Tree Walk** | **7.9 – 8.1 GB/s** | ~0.080 ms/iter | Sequential tape traversal |
 | **NDJSON / JSON Lines Stream** | **3.6 – 3.8 GB/s** | **25.8M docs/sec** | 10,000 log records in memory |
 | **Float Parsing (`fast_float`)** | **74.7 M floats/sec** | ~13.4 ns/op | Lemire algorithm vs `std.fmt` (1.37x faster) |
-| **JSON Minifier & Formatter** | **6.5 – 7.2 GB/s** | ~0.088 ms/iter | Zero-alloc SIMD-safe buffer formatting |
+| **Struct Serialization (`stringify`)** | **699 MB/s** | **~151 ns/op** | **6.61M structs/sec** (**80.7x faster** than `std.json.fmt`) |
+| **Struct Deserialization (Zero-Copy)** | **338 – 375 MB/s** | **~282 – 312 ns/op** | **3.20M – 3.55M structs/sec** (**28x – 33x faster** than `std.json`) |
+| **Struct Deserialization (Arena)** | **22.5 MB/s** | **~4,695 ns/op** | **213K structs/sec** (**1.9x faster** than `std.json`) |
 
 ---
 
@@ -711,7 +713,65 @@ while (try chunk_stream.next()) |doc| {
 
 ---
 
-### 11. Low-Level Utility Modules
+### 11. Struct Serialization & Deserialization (`simdjson.serde`)
+
+`simdjson-zig` provides compile-time reflection-driven serialization and deserialization between native Zig types (`struct`, `enum`, `union`, `optional`, slices, arrays, primitives) and JSON with zero-copy string borrowing and arena lifecycle management.
+
+#### Deserializing JSON into Zig Structs (`parseFromSlice`)
+```zig
+const Endpoint = struct {
+    host: []const u8,
+    port: u16,
+};
+
+const ServiceConfig = struct {
+    name: []const u8,
+    endpoints: []const Endpoint,
+    timeout_ms: u32 = 5000,          // Default value if omitted
+    rate_limit: ?f64 = null,         // Optional field
+    active: bool = true,
+};
+
+const json =
+    \\{
+    \\  "name": "auth_service",
+    \\  "endpoints": [{"host": "127.0.0.1", "port": 8080}],
+    \\  "rate_limit": 500.0
+    \\}
+;
+
+// Deserializes into a memory-managed Parsed(T) container
+var parsed = try simdjson.parseFromSlice(ServiceConfig, allocator, json, .{});
+defer parsed.deinit();
+
+const cfg = parsed.value;
+std.debug.print("Service: {s}, endpoints: {d}\n", .{ cfg.name, cfg.endpoints.len });
+```
+
+#### Deserializing Directly from DOM Elements (`doc.to` / `element.to`)
+```zig
+const doc = try parser.parse(json);
+const cfg = try doc.to(ServiceConfig, allocator);
+defer allocator.free(cfg.name);
+```
+
+#### Serializing Zig Structs to JSON (`stringify` / `stringifyAlloc`)
+```zig
+// 1. Zero heap allocation: Serialize directly into a preallocated stack buffer
+var stack_buf: [512]u8 = undefined;
+const json_slice = try simdjson.stringify(cfg, &stack_buf, .{});
+
+// 2. Allocated serialization:
+const heap_json = try simdjson.stringifyAlloc(allocator, cfg, .{
+    .emit_null_optional_fields = false, // Omit null fields from output
+    .enum_as_string = true,             // Emit "@tagName" for enums
+});
+defer allocator.free(heap_json);
+```
+
+---
+
+### 12. Low-Level Utility Modules
 
 #### Lemire `fast_float` Number Parser (`simdjson.fast_float`)
 Parses IEEE-754 single and double precision floats from character buffers at ~74.7 million floats/sec (1.37x faster than standard library scalar routines).
@@ -800,6 +860,7 @@ simdjson-zig/
 │       ├── dom.zig        # Immutable Tape DOM (Document, Element, Object, Array)
 │       ├── mut_dom.zig    # Mutable in-memory DOM tree
 │       ├── jsonpath.zig   # RFC 9535 JSONPath query engine
+│       ├── serde.zig      # Struct serialization & deserialization (serde)
 │       ├── patch.zig      # RFC 6902 JSON Patch & RFC 7396 Merge Patch
 │       ├── stream.zig     # Sliding window streaming parser (ChunkedDocumentStream)
 │       ├── fast_float.zig # Lemire IEEE-754 fast float algorithm

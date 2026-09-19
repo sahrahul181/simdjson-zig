@@ -70,6 +70,19 @@ pub const jsonpath = @import("simdjson/jsonpath.zig");
 pub const JsonPath = jsonpath.JsonPath;
 pub const JsonPathError = jsonpath.JsonPathError;
 
+// Compile-time reflection serialization & deserialization (Serde)
+pub const serde = @import("simdjson/serde.zig");
+pub const parseFromSlice = serde.parseFromSlice;
+pub const parseFromSliceLeaky = serde.parseFromSliceLeaky;
+pub const parseFromElement = serde.parseFromElement;
+pub const Parsed = serde.Parsed;
+pub const ParseOptions = serde.ParseOptions;
+pub const stringify = serde.stringify;
+pub const stringifyAlloc = serde.stringifyAlloc;
+pub const stringifyWriter = serde.stringifyWriter;
+pub const StringifyOptions = serde.StringifyOptions;
+pub const SerdeError = serde.SerdeError;
+
 // Backward-compatibility alias
 pub const simdjson = @This();
 
@@ -87,7 +100,9 @@ test {
     _ = @import("simdjson/mut_dom.zig");
     _ = @import("simdjson/patch.zig");
     _ = @import("simdjson/jsonpath.zig");
+    _ = @import("simdjson/serde.zig");
 }
+
 
 
 
@@ -1791,6 +1806,155 @@ test "JSONPath (RFC 9535): Built-in functions (length, count), scalar items (@),
     try std.testing.expectEqual(@as(usize, 1), root_res.len);
     try std.testing.expectEqual(simdjson.dom.Type.object, root_res[0].getType());
 }
+
+test "Serde: parseFromSlice into complex nested Zig struct with optionals, enums, slices" {
+    const Protocol = enum { tcp, udp, grpc };
+    const Endpoint = struct {
+        host: []const u8,
+        port: u16,
+        protocol: Protocol = .tcp,
+    };
+    const Config = struct {
+        service_name: []const u8,
+        endpoints: []const Endpoint,
+        timeout_ms: u32 = 5000,
+        rate_limit: ?f64 = null,
+        enabled: bool = true,
+    };
+
+    const json =
+        \\{
+        \\  "service_name": "payment_gateway",
+        \\  "endpoints": [
+        \\    {"host": "10.0.0.1", "port": 8080, "protocol": "tcp"},
+        \\    {"host": "10.0.0.2", "port": 9090, "protocol": "grpc"}
+        \\  ],
+        \\  "rate_limit": 1500.5
+        \\}
+    ;
+
+    var parsed = try simdjson.parseFromSlice(Config, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const cfg = parsed.value;
+    try std.testing.expectEqualStrings("payment_gateway", cfg.service_name);
+    try std.testing.expectEqual(@as(usize, 2), cfg.endpoints.len);
+    try std.testing.expectEqualStrings("10.0.0.1", cfg.endpoints[0].host);
+    try std.testing.expectEqual(@as(u16, 8080), cfg.endpoints[0].port);
+    try std.testing.expectEqual(Protocol.tcp, cfg.endpoints[0].protocol);
+    try std.testing.expectEqualStrings("10.0.0.2", cfg.endpoints[1].host);
+    try std.testing.expectEqual(@as(u16, 9090), cfg.endpoints[1].port);
+    try std.testing.expectEqual(Protocol.grpc, cfg.endpoints[1].protocol);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.timeout_ms); // default value
+    try std.testing.expectEqual(@as(?f64, 1500.5), cfg.rate_limit);
+    try std.testing.expectEqual(true, cfg.enabled); // default value
+}
+
+test "Serde: stringifyAlloc and fixed buffer stringify on nested Zig struct" {
+    const GeoPoint = struct {
+        lat: f64,
+        lon: f64,
+    };
+    const Location = struct {
+        name: []const u8,
+        geo: GeoPoint,
+        altitude: ?i32 = null,
+    };
+
+    const loc = Location{
+        .name = "Tokyo Tower",
+        .geo = .{ .lat = 35.6586, .lon = 139.7454 },
+        .altitude = 333,
+    };
+
+    // 1. Fixed buffer stringify (zero heap allocation)
+    var stack_buf: [256]u8 = undefined;
+    const json_slice = try simdjson.stringify(loc, &stack_buf, .{});
+
+    const expected = "{\"name\":\"Tokyo Tower\",\"geo\":{\"lat\":35.6586,\"lon\":139.7454},\"altitude\":333}";
+    try std.testing.expectEqualStrings(expected, json_slice);
+
+    // 2. Allocated stringify
+    const allocated_json = try simdjson.stringifyAlloc(std.testing.allocator, loc, .{});
+    defer std.testing.allocator.free(allocated_json);
+    try std.testing.expectEqualStrings(expected, allocated_json);
+
+    // 3. Omitting null optionals
+    const loc_no_alt = Location{
+        .name = "Sea Level",
+        .geo = .{ .lat = 0.0, .lon = 0.0 },
+        .altitude = null,
+    };
+    const json_omitted = try simdjson.stringify(loc_no_alt, &stack_buf, .{ .emit_null_optional_fields = false });
+    try std.testing.expectEqualStrings("{\"name\":\"Sea Level\",\"geo\":{\"lat\":0,\"lon\":0}}", json_omitted);
+}
+
+test "Serde: Document.to and Element.to struct deserialization" {
+    const json = "{\"version\": 2, \"active\": true, \"cluster\": \"us-east-1\"}";
+
+    const padded = try std.testing.allocator.alloc(u8, json.len + simdjson.SIMDJSON_PADDING);
+    defer std.testing.allocator.free(padded);
+    @memcpy(padded[0..json.len], json);
+    @memset(padded[json.len..], ' ');
+
+    var idx: [64]u32 = undefined;
+    const cnt = try simdjson.Stage1Indexer.indexPadded(padded, json.len, &idx);
+
+    var tape_buf: [64]u64 = undefined;
+    const tape_len = try simdjson.Stage2Parser.parse(padded, &idx, cnt, &tape_buf);
+
+    const doc = simdjson.Document.init(padded, tape_buf[0..tape_len]);
+
+    const ClusterConfig = struct {
+        version: u32,
+        active: bool,
+        cluster: []const u8,
+    };
+
+    // 1. Directly via doc.to(T)
+    const cfg1 = try doc.to(ClusterConfig, std.testing.allocator);
+    defer std.testing.allocator.free(cfg1.cluster);
+    try std.testing.expectEqual(@as(u32, 2), cfg1.version);
+    try std.testing.expectEqual(true, cfg1.active);
+    try std.testing.expectEqualStrings("us-east-1", cfg1.cluster);
+
+    // 2. Directly via root element: el.to(T)
+    const cfg2 = try doc.root().to(ClusterConfig, std.testing.allocator);
+    defer std.testing.allocator.free(cfg2.cluster);
+    try std.testing.expectEqual(@as(u32, 2), cfg2.version);
+    try std.testing.expectEqual(true, cfg2.active);
+    try std.testing.expectEqualStrings("us-east-1", cfg2.cluster);
+}
+
+test "Serde: Round-trip Zig Struct -> JSON String -> Zig Struct -> JSON String" {
+    const SensorReport = struct {
+        sensor_id: i64,
+        readings: []const f64,
+        status: []const u8,
+    };
+
+    const initial = SensorReport{
+        .sensor_id = 42001,
+        .readings = &.{ 23.4, 24.1, 23.9 },
+        .status = "nominal",
+    };
+
+    // 1. Struct -> JSON String
+    const json1 = try simdjson.stringifyAlloc(std.testing.allocator, initial, .{});
+    defer std.testing.allocator.free(json1);
+
+    // 2. JSON String -> Struct
+    var parsed = try simdjson.parseFromSlice(SensorReport, std.testing.allocator, json1, .{});
+    defer parsed.deinit();
+
+    // 3. Struct -> JSON String
+    const json2 = try simdjson.stringifyAlloc(std.testing.allocator, parsed.value, .{});
+    defer std.testing.allocator.free(json2);
+
+    // Both outputs match bit-for-bit
+    try std.testing.expectEqualStrings(json1, json2);
+}
+
 
 
 

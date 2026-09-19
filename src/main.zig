@@ -403,6 +403,138 @@ fn benchmarkFastFloat(freq: i64) !void {
     , .{ ff_ns_per_op, ff_mops, std_ns_per_op, std_mops, std_ns_per_op / ff_ns_per_op });
 }
 
+fn benchmarkSerde(allocator: std.mem.Allocator, freq: i64) !void {
+    const UserRole = enum { admin, member, guest };
+    const UserRecord = struct {
+        id: i64,
+        name: []const u8,
+        email: []const u8,
+        role: UserRole = .member,
+        active: bool,
+        score: f64,
+    };
+
+    const sample_json = "{\"id\":108291,\"name\":\"Alice Henderson\",\"email\":\"alice.h@example.com\",\"role\":\"admin\",\"active\":true,\"score\":99.75}";
+    const json_bytes = sample_json.len;
+    const iters: usize = 20_000;
+
+    // Warmup
+    for (0..100) |_| {
+        var p = try simdjson.parseFromSlice(UserRecord, allocator, sample_json, .{});
+        p.deinit();
+    }
+
+    // 1. Benchmark simdjson Deserialization
+    const s_start = getTicks();
+    var dummy_id: i64 = 0;
+    for (0..iters) |_| {
+        var p = try simdjson.parseFromSlice(UserRecord, allocator, sample_json, .{});
+        dummy_id +%= p.value.id;
+        p.deinit();
+    }
+    const s_end = getTicks();
+    const s_elapsed_s = @as(f64, @floatFromInt(s_end - s_start)) / @as(f64, @floatFromInt(freq));
+    const s_ns_per_op = (s_elapsed_s / @as(f64, @floatFromInt(iters))) * 1_000_000_000.0;
+    const s_ops_sec = @as(f64, @floatFromInt(iters)) / s_elapsed_s;
+    const s_mb_sec = (@as(f64, @floatFromInt(json_bytes * iters)) / s_elapsed_s) / (1024.0 * 1024.0);
+
+    // 2. Benchmark simdjson Zero-Copy Deserialization (Zero Heap Allocations)
+    const zc_start = getTicks();
+    var zc_dummy_id: i64 = 0;
+    for (0..iters) |_| {
+        const u = try simdjson.parseFromSliceLeaky(UserRecord, allocator, sample_json, .{ .zero_copy_strings = true });
+        zc_dummy_id +%= u.id;
+    }
+    const zc_end = getTicks();
+    const zc_elapsed_s = @as(f64, @floatFromInt(zc_end - zc_start)) / @as(f64, @floatFromInt(freq));
+    const zc_ns_per_op = (zc_elapsed_s / @as(f64, @floatFromInt(iters))) * 1_000_000_000.0;
+    const zc_ops_sec = @as(f64, @floatFromInt(iters)) / zc_elapsed_s;
+    const zc_mb_sec = (@as(f64, @floatFromInt(json_bytes * iters)) / zc_elapsed_s) / (1024.0 * 1024.0);
+
+    // 3. Benchmark std.json Deserialization
+    const std_start = getTicks();
+    var std_dummy_id: i64 = 0;
+    for (0..iters) |_| {
+        var p = try std.json.parseFromSlice(UserRecord, allocator, sample_json, .{});
+        std_dummy_id +%= p.value.id;
+        p.deinit();
+    }
+    const std_end = getTicks();
+    const std_elapsed_s = @as(f64, @floatFromInt(std_end - std_start)) / @as(f64, @floatFromInt(freq));
+    const std_ns_per_op = (std_elapsed_s / @as(f64, @floatFromInt(iters))) * 1_000_000_000.0;
+    const std_ops_sec = @as(f64, @floatFromInt(iters)) / std_elapsed_s;
+    const std_mb_sec = (@as(f64, @floatFromInt(json_bytes * iters)) / std_elapsed_s) / (1024.0 * 1024.0);
+
+    // 4. Benchmark Serialization
+    const user_instance = UserRecord{
+        .id = 108291,
+        .name = "Alice Henderson",
+        .email = "alice.h@example.com",
+        .role = .admin,
+        .active = true,
+        .score = 99.75,
+    };
+
+    const ser_iters: usize = 50_000;
+    var stack_buf: [256]u8 = undefined;
+
+    // simdjson stack stringify
+    const ser_s_start = getTicks();
+    var total_bytes: usize = 0;
+    for (0..ser_iters) |_| {
+        const out = try simdjson.stringify(user_instance, &stack_buf, .{});
+        total_bytes +%= out.len;
+    }
+    const ser_s_end = getTicks();
+    const ser_s_elapsed_s = @as(f64, @floatFromInt(ser_s_end - ser_s_start)) / @as(f64, @floatFromInt(freq));
+    const ser_s_ns_per_op = (ser_s_elapsed_s / @as(f64, @floatFromInt(ser_iters))) * 1_000_000_000.0;
+    const ser_s_ops_sec = @as(f64, @floatFromInt(ser_iters)) / ser_s_elapsed_s;
+    const ser_s_mb_sec = (@as(f64, @floatFromInt(json_bytes * ser_iters)) / ser_s_elapsed_s) / (1024.0 * 1024.0);
+
+    // std.json stringify via allocPrint
+    const ser_std_start = getTicks();
+    for (0..ser_iters) |_| {
+        const s = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(user_instance, .{})});
+        total_bytes +%= s.len;
+        allocator.free(s);
+    }
+    const ser_std_end = getTicks();
+    const ser_std_elapsed_s = @as(f64, @floatFromInt(ser_std_end - ser_std_start)) / @as(f64, @floatFromInt(freq));
+    const ser_std_ns_per_op = (ser_std_elapsed_s / @as(f64, @floatFromInt(ser_iters))) * 1_000_000_000.0;
+    const ser_std_ops_sec = @as(f64, @floatFromInt(ser_iters)) / ser_std_elapsed_s;
+    const ser_std_mb_sec = (@as(f64, @floatFromInt(json_bytes * ser_iters)) / ser_std_elapsed_s) / (1024.0 * 1024.0);
+
+    std.mem.doNotOptimizeAway(dummy_id);
+    std.mem.doNotOptimizeAway(zc_dummy_id);
+    std.mem.doNotOptimizeAway(std_dummy_id);
+    std.mem.doNotOptimizeAway(total_bytes);
+
+    std.debug.print(
+        \\------------------------------------------------------------------------
+        \\Struct Serde Benchmark: UserRecord ({d} bytes/struct)
+        \\------------------------------------------------------------------------
+        \\  [Deserialization]
+        \\    simdjson.parseFromSlice (Arena)     : {d:.1} ns/op | {d:.2} MB/s ({d:.0} structs/sec)
+        \\    simdjson.parseFromSlice (Zero-Copy) : {d:.1} ns/op | {d:.2} MB/s ({d:.0} structs/sec)
+        \\    std.json.parseFromSlice             : {d:.1} ns/op | {d:.2} MB/s ({d:.0} structs/sec)
+        \\    Speedup (Zero-Copy vs std.json)     : {d:.2}x faster
+        \\  [Serialization]
+        \\    simdjson.stringify (stack buf)      : {d:.1} ns/op | {d:.2} MB/s ({d:.0} structs/sec)
+        \\    std.json.fmt                        : {d:.1} ns/op | {d:.2} MB/s ({d:.0} structs/sec)
+        \\    Speedup                             : {d:.2}x faster
+        \\
+    , .{
+        json_bytes,
+        s_ns_per_op, s_mb_sec, s_ops_sec,
+        zc_ns_per_op, zc_mb_sec, zc_ops_sec,
+        std_ns_per_op, std_mb_sec, std_ops_sec,
+        std_ns_per_op / zc_ns_per_op,
+        ser_s_ns_per_op, ser_s_mb_sec, ser_s_ops_sec,
+        ser_std_ns_per_op, ser_std_mb_sec, ser_std_ops_sec,
+        ser_std_ns_per_op / ser_s_ns_per_op,
+    });
+}
+
 pub fn main(init: std.process.Init) !void {
     const twitter_data = @embedFile("data/twitter.json");
     const citm_data = @embedFile("data/citm_catalog.json");
@@ -422,6 +554,7 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkDataset("citm_catalog.json", citm_data, init.gpa, freq, 1000);
     try benchmarkNdjsonStream(init.gpa, freq);
     try benchmarkFastFloat(freq);
+    try benchmarkSerde(init.gpa, freq);
 
     std.debug.print("========================================================================\n\n", .{});
 }

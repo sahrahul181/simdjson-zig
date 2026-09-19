@@ -73,6 +73,16 @@ pub const Document = struct {
         return self.root().stringifyAlloc(allocator);
     }
 
+    /// Deserializes the root DOM element into native Zig type `T`.
+    pub fn to(self: Document, comptime T: type, allocator: std.mem.Allocator) !T {
+        return self.root().to(T, allocator);
+    }
+
+    /// Deserializes the root DOM element into native Zig type `T` with options.
+    pub fn toWithOptions(self: Document, comptime T: type, allocator: std.mem.Allocator, options: anytype) !T {
+        return self.root().toWithOptions(T, allocator, options);
+    }
+
     /// Pretty-prints the entire document with indentation.
     pub fn formatJson(self: Document, writer: anytype, options: FormatOptions) !void {
         try self.root().formatJson(writer, options);
@@ -331,6 +341,19 @@ pub const Element = struct {
         try self.writeJson(&alloc_writer.writer);
         return try alloc_writer.toOwnedSlice();
     }
+
+    /// Deserializes this DOM Element into native Zig type `T`.
+    pub fn to(self: Element, comptime T: type, allocator: std.mem.Allocator) !T {
+        const serde = @import("serde.zig");
+        return serde.parseFromElement(T, allocator, self, .{});
+    }
+
+    /// Deserializes this DOM Element into native Zig type `T` with options.
+    pub fn toWithOptions(self: Element, comptime T: type, allocator: std.mem.Allocator, options: anytype) !T {
+        const serde = @import("serde.zig");
+        return serde.parseFromElement(T, allocator, self, options);
+    }
+
 
     /// Pretty-prints this DOM Element into writer with formatting options.
     pub fn formatJson(self: Element, writer: anytype, options: FormatOptions) !void {
