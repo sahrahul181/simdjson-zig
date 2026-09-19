@@ -74,6 +74,7 @@ pub fn ChunkedDocumentStream(comptime ReaderType: type) type {
 
         capacity: usize,
         buf_len: usize = 0,
+        indexed_len: usize = 0,
         doc_start_byte: usize = 0,
         cur_struct: usize = 0,
         structurals_count: usize = 0,
@@ -146,7 +147,10 @@ pub fn ChunkedDocumentStream(comptime ReaderType: type) type {
         fn growWindow(self: *Self) !void {
             const alloc = self.allocator orelse return error.Capacity;
             const new_cap = self.capacity * 2;
-            if (new_cap > self.options.max_capacity) return error.Capacity;
+            if (new_cap > self.options.max_capacity) {
+                std.debug.print("\n[DEBUG] growWindow capacity exceeded: new_cap={d} > max={d}\n", .{ new_cap, self.options.max_capacity });
+                return error.Capacity;
+            }
 
             const new_window = try alloc.alloc(u8, new_cap + SIMDJSON_PADDING);
             @memcpy(new_window[0..self.buf_len], self.window_buf[0..self.buf_len]);
@@ -194,13 +198,31 @@ pub fn ChunkedDocumentStream(comptime ReaderType: type) type {
                 return false;
             }
 
-            @memset(self.window_buf[self.buf_len .. self.buf_len + SIMDJSON_PADDING], ' ');
+            // For streams with newlines (NDJSON / JSON lines), safe-trim Stage 1 to the last newline
+            // so arbitrary chunk reads don't fail with UnclosedString on a split trailing line.
+            var index_len = self.buf_len;
+            if (!self.eof and index_len > 0) {
+                if (std.mem.lastIndexOfScalar(u8, self.window_buf[0..index_len], '\n')) |last_nl| {
+                    if (last_nl > 0 and last_nl < index_len - 1) {
+                        index_len = last_nl + 1;
+                    }
+                }
+            }
+
+            self.indexed_len = index_len;
+            var saved_pad: [SIMDJSON_PADDING]u8 = undefined;
+            const pad_to_save = @min(SIMDJSON_PADDING, self.buf_len - index_len);
+            @memcpy(saved_pad[0..pad_to_save], self.window_buf[index_len .. index_len + pad_to_save]);
+            @memset(self.window_buf[index_len .. index_len + SIMDJSON_PADDING], ' ');
 
             const index_res = Stage1Indexer.indexPadded(
                 self.window_buf,
-                self.buf_len,
+                index_len,
                 self.indexes_buf,
             );
+
+            // Restore original bytes immediately so window_buf is not corrupted
+            @memcpy(self.window_buf[index_len .. index_len + pad_to_save], saved_pad[0..pad_to_save]);
 
             if (index_res) |cnt| {
                 self.structurals_count = cnt;
@@ -256,7 +278,7 @@ pub fn ChunkedDocumentStream(comptime ReaderType: type) type {
                 }
 
                 if (self.cur_struct >= self.structurals_count) {
-                    self.doc_start_byte = self.buf_len;
+                    self.doc_start_byte = self.indexed_len;
                     continue;
                 }
 
@@ -264,7 +286,7 @@ pub fn ChunkedDocumentStream(comptime ReaderType: type) type {
 
                 var cur = self.cur_struct;
                 const res = Stage2Parser.parseSingle(
-                    self.window_buf[0 .. self.buf_len],
+                    self.window_buf[0..self.indexed_len],
                     self.indexes_buf,
                     self.structurals_count,
                     &cur,
@@ -277,11 +299,11 @@ pub fn ChunkedDocumentStream(comptime ReaderType: type) type {
                         if (cur < self.structurals_count) {
                             self.doc_start_byte = self.indexes_buf[cur];
                         } else {
-                            self.doc_start_byte = self.buf_len;
+                            self.doc_start_byte = self.indexed_len;
                         }
-                        return Document.init(self.window_buf[0 .. self.buf_len], self.tape_buf[0..tape_len]);
+                        return Document.init(self.window_buf[0..self.indexed_len], self.tape_buf[0..tape_len]);
                     } else {
-                        self.doc_start_byte = self.buf_len;
+                        self.doc_start_byte = self.indexed_len;
                         self.cur_struct = self.structurals_count;
                         continue;
                     }
