@@ -4,6 +4,9 @@ A high-performance, zero-allocation, SIMD-accelerated JSON parsing engine implem
 
 `simdjson-zig` parses JSON at multi-gigabytes per second per core, utilizing AVX2 256-bit vector instructions on x86_64 and ARM NEON on AArch64. Beyond raw parsing speed, it provides a comprehensive suite of standards-compliant tooling: **OnDemand stream parsing**, **RFC 9535 JSONPath**, **RFC 6901 JSON Pointer**, **RFC 6902 JSON Patch**, **RFC 7396 JSON Merge Patch**, **NDJSON streaming**, **Chunked Sliding Window streaming**, and **Mutable DOM trees**.
 
+> [!WARNING]
+> **Experimental Software**: `simdjson-zig` is currently in active early development and is considered **experimental**. While covered by 100 unit/integration tests and verified against upstream datasets, APIs may evolve and the parser may contain bugs, edge-case discrepancies, or incomplete platform optimizations. Use with care, and avoid mission-critical production deployment without thorough testing and fuzzing.
+
 ---
 
 ## Benchmark Results (Zig 0.16.0 `ReleaseFast`, AVX2)
@@ -37,7 +40,19 @@ A high-performance, zero-allocation, SIMD-accelerated JSON parsing engine implem
 
 ## Installation (Zig 0.16.0)
 
-### 1. Add Dependency to `build.zig.zon`
+### 1. Add Dependency
+
+Add `simdjson-zig` to your project using `zig fetch --save` (which automatically computes the content hash and adds it to `build.zig.zon`):
+
+```bash
+# Fetch latest main branch
+zig fetch --save git+https://github.com/sahrahul181/simdjson-zig.git#main
+
+# Or fetch a specific commit hash
+# zig fetch --save git+https://github.com/sahrahul181/simdjson-zig.git#<commit_hash>
+```
+
+This updates your `build.zig.zon`:
 
 ```zig
 .{
@@ -47,8 +62,8 @@ A high-performance, zero-allocation, SIMD-accelerated JSON parsing engine implem
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .simdjson = .{
-            .url = "https://github.com/your-username/simdjson-zig/archive/refs/tags/v1.0.0.tar.gz",
-            .hash = "...", // Computed by zig build --fetch
+            .url = "git+https://github.com/sahrahul181/simdjson-zig.git#main",
+            .hash = "...", // Computed automatically by zig fetch --save
         },
     },
     .paths = .{
@@ -799,6 +814,43 @@ simdjson-zig/
 
 ---
 
+## Contributing & Reporting Issues
+
+Contributions, bug reports, and optimizations are warmly welcomed!
+
+### Opening an Issue
+
+If you discover a bug, unexpected panic, memory issue, or parity discrepancy with upstream C++ `simdjson`:
+1. Search [existing GitHub issues](https://github.com/sahrahul181/simdjson-zig/issues) to see if it has already been reported.
+2. Open a new issue at [github.com/sahrahul181/simdjson-zig/issues](https://github.com/sahrahul181/simdjson-zig/issues) with:
+   - **Environment Details**: Operating system, CPU architecture (`x86_64`, `aarch64`), and exact Zig version (`zig version`).
+   - **Minimal Reproduction**: Provide a small JSON snippet and the Zig code demonstrating the failure.
+   - **Expected vs Actual**: Describe what you expected to happen vs what actually happened (including stack traces or error names).
+
+### Contributing Code & Pull Requests
+
+1. **Fork the Repository**: Create your fork on GitHub.
+2. **Create a Feature Branch**:
+   ```bash
+   git checkout -b feature/my-enhancement
+   ```
+3. **Write Tests**: Add tests covering new functionality or bug fixes in `src/root.zig` or the relevant submodule in `src/simdjson/`.
+4. **Format & Test**:
+   ```bash
+   # Format source files
+   zig fmt src/ build.zig
+
+   # Run test suite
+   zig build test --summary all
+   ```
+5. **Benchmark Integrity**: Ensure that changes do not introduce performance regressions:
+   ```bash
+   zig build bench -Doptimize=ReleaseFast
+   ```
+6. **Submit Pull Request**: Push to your fork and submit a PR with a clear description of changes.
+
+---
+
 ## Credits & Acknowledgements
 
 This library is a clean-room Zig port and independent implementation deeply inspired by the pioneering work, papers, and software created by **Daniel Lemire**, **Geoff Langdale**, and the `simdjson` community.
@@ -824,4 +876,4 @@ We express our profound gratitude to the original researchers and authors for pu
 
 ## License
 
-This project is licensed under the **MIT License**. See the [LICENSE](file:///c:/Users/sahra/Desktop/test/LICENSE) file for the full license text and attribution notices.
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for the full license text and attribution notices.
