@@ -632,6 +632,10 @@ pub const MutDocument = struct {
         return &self.root_element;
     }
 
+    pub inline fn getAllocator(self: *MutDocument) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
     pub inline fn writeJson(self: *const MutDocument, writer: anytype) !void {
         try self.root_element.writeJson(writer);
     }

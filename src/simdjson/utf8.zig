@@ -5,6 +5,8 @@ const Vec64u8 = common.Vec64u8;
 const Vec32u8 = common.Vec32u8;
 const Vec16u8 = common.Vec16u8;
 
+pub const validate = Utf8Validator.validate;
+
 pub const Utf8Validator = struct {
     has_non_ascii: bool = false,
 

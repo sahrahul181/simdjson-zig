@@ -302,8 +302,8 @@ pub const Stage2Parser = struct {
 
 #### Example (Zig 0.16.0)
 ```zig
-// Tape buffer size is bounded by (structurals + 4) words
-const tape_buf = try allocator.alloc(u64, count + 4);
+// Tape buffer size requires (count * 2 + 16) words
+const tape_buf = try allocator.alloc(u64, count * 2 + 16);
 defer allocator.free(tape_buf);
 
 var diag = simdjson.Diagnostic{};
@@ -647,8 +647,8 @@ try root.set("project", "simdjson-zig");
 try root.set("version", 1);
 
 var tags_arr = simdjson.MutArray{};
-try tags_arr.append(allocator, "fast");
-try tags_arr.append(allocator, "zero-alloc");
+try tags_arr.append(mut_doc.getAllocator(), "fast");
+try tags_arr.append(mut_doc.getAllocator(), "zero-alloc");
 try root.set("tags", tags_arr);
 
 // Modify via pointer
@@ -801,7 +801,7 @@ defer allocator.free(heap_json);
 Parses IEEE-754 single and double precision floats from character buffers at ~74.7 million floats/sec (1.37x faster than standard library scalar routines).
 ```zig
 const res = try simdjson.fast_float.parse("3.141592653589793");
-std.debug.print("Float value: {d}\n", .{res.val});
+std.debug.print("Float value: {d}\n", .{res});
 ```
 
 #### SIMD UTF-8 Validation (`simdjson.utf8`)
@@ -820,7 +820,7 @@ const unescaped = try simdjson.unescapeString("Hello\\nWorld\\uD83D\\uDE00", &ou
 #### Visual Diagnostic Formatting (`simdjson.Diagnostic`)
 Produces rich compiler-style error diagnostics with 1-based line/column pointers and code snippets.
 ```zig
-var diag = simdjson.Diagnostic.compute(json_buf, error_byte_offset, error.TrailingComma);
+const diag = simdjson.Diagnostic.compute(json_buf, error_byte_offset, error.TrailingComma);
 std.debug.print("{s}\n", .{diag.format()});
 ```
 

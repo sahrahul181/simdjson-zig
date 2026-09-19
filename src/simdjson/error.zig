@@ -43,11 +43,11 @@ pub fn errorMessage(err: SimdJsonError) []const u8 {
 /// Rich Line/Column Error Diagnostic for SIMD JSON parsing.
 /// Zero heap allocations, zero cost on the happy path.
 pub const Diagnostic = struct {
-    line: usize,
-    column: usize,
-    byte_offset: usize,
-    err: SimdJsonError,
-    line_slice: []const u8,
+    line: usize = 0,
+    column: usize = 0,
+    byte_offset: usize = 0,
+    err: SimdJsonError = error.Empty,
+    line_slice: []const u8 = "",
     custom_msg: ?[]const u8 = null,
 
     /// Computes exact 1-based line and column, byte offset, and line snippet from input buffer.
