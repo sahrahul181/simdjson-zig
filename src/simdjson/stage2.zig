@@ -31,7 +31,7 @@ pub const Stage2Parser = struct {
         validate_strings: bool = false,
     };
 
-    pub inline fn findStringEndFast(comptime validate_strings: bool, buf_ptr: [*]const u8, start_pos: usize, has_escapes: *bool) usize {
+    pub inline fn findStringEnd(buf_ptr: [*]const u8, start_pos: usize) usize {
         var p = start_pos;
         while (true) {
             const chunk = @as(*align(1) const ScanVec, @ptrCast(buf_ptr + p)).*;
@@ -43,7 +43,6 @@ pub const Stage2Parser = struct {
             }
 
             if (bs_bits != 0) {
-                if (comptime validate_strings) has_escapes.* = true;
                 p += @ctz(bs_bits) + 2;
                 continue;
             }
@@ -51,9 +50,24 @@ pub const Stage2Parser = struct {
         }
     }
 
-    pub inline fn findStringEnd(buf_ptr: [*]const u8, start_pos: usize) usize {
-        var dummy = false;
-        return findStringEndFast(false, buf_ptr, start_pos, &dummy);
+    pub inline fn findStringEndWithEscapes(buf_ptr: [*]const u8, start_pos: usize, has_escapes: *bool) usize {
+        var p = start_pos;
+        while (true) {
+            const chunk = @as(*align(1) const ScanVec, @ptrCast(buf_ptr + p)).*;
+            const quote_bits: ScanMask = @bitCast(chunk == @as(ScanVec, @splat('"')));
+            const bs_bits: ScanMask = @bitCast(chunk == @as(ScanVec, @splat('\\')));
+
+            if (((bs_bits -% 1) & quote_bits) != 0) {
+                return p + @ctz(quote_bits);
+            }
+
+            if (bs_bits != 0) {
+                has_escapes.* = true;
+                p += @ctz(bs_bits) + 2;
+                continue;
+            }
+            p += ScanVecLen;
+        }
     }
 
     inline fn isNumberTerminator(c: u8) bool {
@@ -87,9 +101,8 @@ pub const Stage2Parser = struct {
         }
 
         // Post-loop validation
-        const digit_count = p - start_digits;
-        if (digit_count == 0) return error.NumberError;
-        if (digit_count > 1 and buf_ptr[start_digits] == '0') return error.NumberError;
+        if (p == start_digits) return error.NumberError;
+        if (p > start_digits + 1 and buf_ptr[start_digits] == '0') return error.NumberError;
 
         const c = buf_ptr[p];
         if (c != '.' and (c | 0x20) != 'e') {
@@ -97,21 +110,22 @@ pub const Stage2Parser = struct {
                 if (!isNumberTerminator(c)) {
                     if (p < buf_len) return error.NumberError;
                 }
-            }
-            if (digit_count > 18) {
-                const slice = buf_ptr[start_digits..p];
-                if (is_neg) {
-                    const parsed = std.fmt.parseInt(i64, slice, 10) catch {
-                        return parseFloatCold(buf_ptr, pos, buf_len, writer);
-                    };
-                    writer.appendInt64(-parsed);
-                } else {
-                    const parsed = std.fmt.parseInt(u64, slice, 10) catch {
-                        return parseFloatCold(buf_ptr, pos, buf_len, writer);
-                    };
-                    writer.appendUint64(parsed);
+                const digit_count = p - start_digits;
+                if (digit_count > 18) {
+                    const slice = buf_ptr[start_digits..p];
+                    if (is_neg) {
+                        const parsed = std.fmt.parseInt(i64, slice, 10) catch {
+                            return parseFloatCold(buf_ptr, pos, buf_len, writer);
+                        };
+                        writer.appendInt64(-parsed);
+                    } else {
+                        const parsed = std.fmt.parseInt(u64, slice, 10) catch {
+                            return parseFloatCold(buf_ptr, pos, buf_len, writer);
+                        };
+                        writer.appendUint64(parsed);
+                    }
+                    return;
                 }
-                return;
             }
             if (is_neg) {
                 writer.appendInt64(-@as(i64, @intCast(val)));
@@ -217,13 +231,14 @@ pub const Stage2Parser = struct {
 
         switch (c) {
             '"' => {
-                var has_escapes = false;
-                const str_end = findStringEndFast(options.validate_strings, buf_ptr, pos + 1, &has_escapes);
-                if (comptime options.validate_strings) {
+                const str_end = if (comptime options.validate_strings) blk: {
+                    var has_escapes = false;
+                    const end = findStringEndWithEscapes(buf_ptr, pos + 1, &has_escapes);
                     if (has_escapes) {
-                        try validateEscapes(buf_ptr[pos + 1 .. str_end]);
+                        try validateEscapes(buf_ptr[pos + 1 .. end]);
                     }
-                }
+                    break :blk end;
+                } else findStringEnd(buf_ptr, pos + 1);
                 writer.append2(str_end - (pos + 1), pos + 1, .STRING);
                 return cur_struct + 1;
             },
@@ -327,18 +342,19 @@ pub const Stage2Parser = struct {
                     in_array = container_stack[depth - 1].is_array;
                 } else {
                     if (c != '"') return error.TapeError;
-                    var has_escapes = false;
-                    const str_end = findStringEndFast(options.validate_strings, buf_ptr, pos + 1, &has_escapes);
-                    if (comptime options.validate_strings) {
+                    const str_end = if (comptime options.validate_strings) blk: {
+                        var has_escapes = false;
+                        const end = findStringEndWithEscapes(buf_ptr, pos + 1, &has_escapes);
                         if (has_escapes) {
-                            try validateEscapes(buf_ptr[pos + 1 .. str_end]);
+                            try validateEscapes(buf_ptr[pos + 1 .. end]);
                         }
-                    }
+                        break :blk end;
+                    } else findStringEnd(buf_ptr, pos + 1);
                     writer.append2(str_end - (pos + 1), pos + 1, .STRING);
 
                     cur_struct += 2;
-                    if (cur_struct >= structurals_count) return error.TapeError;
                     if (comptime options.validate_strings) {
+                        if (cur_struct >= structurals_count) return error.TapeError;
                         if (buf_ptr[indexes_ptr[cur_struct - 1]] != ':') return error.TapeError;
                     }
                     const val_pos = indexes_ptr[cur_struct];
@@ -454,7 +470,9 @@ pub const Stage2Parser = struct {
     ) SimdJsonError!usize {
         var cur: usize = 0;
         const len = (try parseSingleOptions(options, buf, indexes, structurals_count, &cur, tape_buf)) orelse return error.Empty;
-        if (cur < structurals_count) return error.TapeError;
+        if (comptime options.validate_strings) {
+            if (cur < structurals_count) return error.TapeError;
+        }
         return len;
     }
 
