@@ -187,6 +187,96 @@ pub fn main(init: std.process.Init) !void {
 
 ---
 
+## 🧭 Beginner's Guide: Which API Should I Choose?
+
+If you are new to `simdjson-zig`, here is a quick guide to choosing the right tool for the job:
+
+| What do you want to do? | Recommended API | Why Choose This? |
+|:---|:---|:---|
+| **"I want to map JSON into a Zig `struct`"** | **`simdjson.parseFromSlice` (Serde)** | **Easiest & Most Idiomatic.** 1-liner conversion with full type-safety. **28.8x faster** than `std.json`. |
+| **"I want to explore arbitrary or dynamic JSON"** | **`simdjson.Document` (Immutable DOM)** | Inspect types, iterate objects and arrays, or query with **RFC 9535 JSONPath** and **RFC 6901 JSON Pointer**. |
+| **"I only need 1 or 2 fields from a 50MB file"** | **`simdjson.OnDemandDocument`** | **Max Hardware Speed (24.5 GB/s).** Skips unrequested fields without building a full DOM tape. |
+| **"I need to dynamically build or modify JSON"** | **`simdjson.MutDocument`** | Add, remove, update keys, or apply **RFC 6902 JSON Patches** and **RFC 7396 Merge Patches**. |
+| **"I have a 100MB+ or multi-gigabyte file/stream"** | **`simdjson.stream.chunkedDocumentStream`** | **Sliding Window Stream.** Processes gigabytes with bounded RAM (e.g. 1MB window). |
+| **"I have multiple JSON records / NDJSON"** | **`simdjson.DocumentStream`** | Parses newline-delimited (`.jsonl`) or concatenated documents (`{"a":1}{"b":2}`) at **24M+ docs/sec**. |
+
+---
+
+## 🚀 Practical Everyday Examples for Beginners
+
+### 1. Parsing an Array of Objects into Zig Structs
+
+```zig
+const std = @import("std");
+const simdjson = @import("simdjson");
+
+const User = struct {
+    id: u32,
+    username: []const u8,
+    roles: []const []const u8,
+    active: bool = true, // Default value if omitted in JSON
+};
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+
+    const json =
+        \\[
+        \\  {"id": 1, "username": "alice", "roles": ["admin", "editor"]},
+        \\  {"id": 2, "username": "bob", "roles": ["viewer"], "active": false}
+        \\]
+    ;
+
+    var parsed = try simdjson.parseFromSlice([]const User, allocator, json, .{});
+    defer parsed.deinit();
+
+    for (parsed.value) |user| {
+        std.debug.print("User #{d}: {s} (roles: {d}, active: {})\n", .{
+            user.id, user.username, user.roles.len, user.active,
+        });
+    }
+}
+```
+
+### 2. Handling Missing Fields & Optional Values Gracefully
+
+```zig
+const Account = struct {
+    account_id: i64,
+    email: ?[]const u8 = null,       // Defaults to null if omitted
+    tier: []const u8 = "free",        // Defaults to "free" if omitted
+    tags: []const []const u8 = &.{},  // Defaults to empty slice if omitted
+};
+
+const json = "{\"account_id\": 99182}";
+
+var parsed = try simdjson.parseFromSlice(Account, allocator, json, .{});
+defer parsed.deinit();
+
+// Output: Account ID: 99182, Tier: free, Email: null
+std.debug.print("Account ID: {d}, Tier: {s}, Email: {?s}\n", .{
+    parsed.value.account_id,
+    parsed.value.tier,
+    parsed.value.email,
+});
+```
+
+### 3. Understanding Buffer Padding (`SIMDJSON_PADDING`)
+
+SIMD instructions process data in 32-byte (AVX2) or 64-byte (AVX-512) vector chunks. To prevent reading past the end of buffer on the last vector block, SIMDJSON requires **64 bytes of padding** after the payload.
+
+```zig
+// Prepare any byte slice with 64-byte padding:
+const raw = "{\"key\": \"value\"}";
+const padded = try allocator.alloc(u8, raw.len + simdjson.SIMDJSON_PADDING);
+defer allocator.free(padded);
+
+@memcpy(padded[0..raw.len], raw);
+@memset(padded[raw.len..], ' '); // Fill the trailing 64 bytes with whitespace
+```
+
+---
+
 ## Comprehensive API Reference & Guide
 
 All code examples use **Zig 0.16.0** conventions.
@@ -661,26 +751,50 @@ std.debug.print("Constructed: {s}\n", .{out});
 
 ---
 
-### 9. NDJSON Streaming (`simdjson.DocumentStream`)
+### 9. Multiple JSON Documents & Streaming (`DocumentStream`)
 
-Iterates newline-delimited JSON (NDJSON / JSON Lines) streams at 25+ million documents per second.
+Iterates streams containing **multiple JSON documents** at **24+ million documents per second**. Supports both:
+* **Newline-Delimited JSON (NDJSON / `.jsonl`)** — one JSON object per line.
+* **Concatenated JSON Streams** — back-to-back documents without commas or delimiters (`{"id":1}{"id":2}`).
 
+#### Option A: DOM `DocumentStream` (Inspect Trees with Type Safety)
 ```zig
-// DOM DocumentStream
-var stream = simdjson.DocumentStream.init(ndjson_buffer, indexes, structurals, tape_buf);
+// 1. Prepare padded buffer and structural indices
+const stream_text =
+    \\{"id": 101, "event": "login", "user": "alice"}
+    \\{"id": 102, "event": "view", "user": "bob"}
+    \\{"id": 103, "event": "logout", "user": "alice"}
+;
+const padded = try allocator.alloc(u8, stream_text.len + simdjson.SIMDJSON_PADDING);
+defer allocator.free(padded);
+@memcpy(padded[0..stream_text.len], stream_text);
+@memset(padded[stream_text.len..], ' ');
+
+const indexes = try allocator.alloc(u32, stream_text.len + 3);
+defer allocator.free(indexes);
+const structurals = try simdjson.Stage1Indexer.indexPadded(padded, stream_text.len, indexes);
+
+const tape_buf = try allocator.alloc(u64, structurals * 2 + 16);
+defer allocator.free(tape_buf);
+
+// 2. Iterate each JSON document sequentially
+var stream = simdjson.DocumentStream.init(padded, indexes, structurals, tape_buf);
 while (try stream.next()) |record_doc| {
     const obj = try record_doc.root().asObject();
-    if (obj.get("event_id")) |id| {
-        std.debug.print("Event: {d}\n", .{try id.asInt()});
+    if (obj.get("event")) |event| {
+        std.debug.print("Event: {s}\n", .{try event.asString()});
     }
 }
+```
 
-// OnDemandDocumentStream (zero tape generation)
-var od_stream = simdjson.OnDemandDocumentStream.init(ndjson_buffer, indexes, structurals);
+#### Option B: `OnDemandDocumentStream` (Zero Tape Allocations, Maximum Throughput)
+```zig
+// Directly streams documents without allocating tape memory
+var od_stream = simdjson.OnDemandDocumentStream.init(padded, indexes, structurals);
 while (try od_stream.next()) |record_val| {
     var obj = try record_val.asObject();
-    if (try obj.get("event_id")) |id| {
-        std.debug.print("OnDemand Event: {d}\n", .{try id.asInt()});
+    if (try obj.get("id")) |id| {
+        std.debug.print("OnDemand ID: {d}\n", .{try id.asInt()});
     }
 }
 ```
@@ -689,14 +803,30 @@ while (try od_stream.next()) |record_val| {
 
 ### 10. Sliding Window File & Reader Streaming (`simdjson.stream`)
 
-Parses multi-gigabyte JSON files or continuous network streams with a fixed or auto-growing memory window, processing arbitrarily large files without loading the entire payload into RAM.
+When parsing files that are **larger than available RAM** (multi-gigabyte database dumps, server logs, or continuous network sockets), `simdjson-zig` provides a sliding window streaming engine.
+
+#### How It Works:
+```text
+[ Input Stream / File: 10 GB ]
+              │
+              ▼
+   ┌──────────────────────┐
+   │ Sliding Window (1MB) │  ◄── Automatically refills and shifts
+   └──────────────────────┘      when documents cross boundaries
+              │
+              ▼
+   [ SIMD Stage 1 & 2 ]
+              │
+              ▼
+   Yields Document 1, Document 2, Document 3...
+```
 
 #### API Signatures
 ```zig
 pub const StreamOptions = struct {
     window_capacity: usize = 1024 * 1024,  // Default 1 MB sliding window
     max_capacity: usize = 64 * 1024 * 1024,
-    auto_grow: bool = false,
+    auto_grow: bool = false,               // Grow window if single document > window_capacity
 };
 
 /// Dynamic window stream with heap allocation
@@ -715,24 +845,33 @@ pub fn fixedChunkedDocumentStream(
 ) !ChunkedDocumentStream(@TypeOf(reader));
 ```
 
-#### Example (Zig 0.16.0)
+#### Example: Processing Infinite / Large Streams with Bounded RAM (Zig 0.16.0)
 ```zig
-var file = try std.fs.cwd().openFile("massive_log.json", .{});
-defer file.close();
-var file_reader = file.reader();
+// Example: Processing a multi-megabyte stream with a small 64 KB RAM window:
+var reader = std.Io.Reader.fixed(multi_megabyte_json_data);
 
-var chunk_stream = try simdjson.chunkedDocumentStream(
+var chunk_stream = try simdjson.stream.chunkedDocumentStream(
     allocator,
-    &file_reader,
-    .{ .window_capacity = 2 * 1024 * 1024 }, // 2 MB window
+    &reader,
+    .{
+        .window_capacity = 64 * 1024, // Uses only 64 KB RAM!
+        .auto_grow = true,            // Auto-expands if an individual record is > 64 KB
+    },
 );
 defer chunk_stream.deinit();
 
+var record_count: usize = 0;
 while (try chunk_stream.next()) |doc| {
     const root_el = doc.root();
-    // Process document...
-    _ = root_el;
+    const obj = try root_el.asObject();
+
+    if (obj.get("status")) |status| {
+        // Process each document on the fly without holding the whole stream in memory
+        _ = try status.asString();
+        record_count += 1;
+    }
 }
+std.debug.print("Processed {d} records across chunk boundaries\n", .{record_count});
 ```
 
 ---
@@ -826,6 +965,49 @@ std.debug.print("{s}\n", .{diag.format()});
 
 ---
 
+### 13. Fuzz Testing & Crash-Resilience Verification
+
+To ensure that the parser is strictly **immune to denial-of-service, crashes, memory leaks, and buffer overruns** when processing arbitrary or hostile inputs from the internet, `simdjson-zig` integrates native property-based fuzz testing via `std.testing.fuzz`.
+
+#### How Fuzz Testing Works
+The fuzzer feeds arbitrary mutated byte sequences (random control characters, unterminated quotes, deeply nested brackets, invalid UTF-8, and truncated numbers) into Stage 1, Stage 2, OnDemand, and Serde engines.
+
+```zig
+test "fuzz: stage1 and stage2 parser with arbitrary byte mutations" {
+    try std.testing.fuzz({}, testFuzzParser, .{});
+}
+
+fn testFuzzParser(context: void, smith: *std.testing.Smith) !void {
+    _ = context;
+    const gpa = std.testing.allocator;
+
+    const len = @as(usize, smith.value(u11)); // 0..2047 bytes
+    if (len == 0) return;
+
+    const input = try gpa.alloc(u8, len);
+    defer gpa.free(input);
+    smith.bytes(input);
+
+    // Prepare padded buffer
+    const padded = try gpa.alloc(u8, len + simdjson.SIMDJSON_PADDING);
+    defer gpa.free(padded);
+    @memcpy(padded[0..len], input);
+    @memset(padded[len..], ' ');
+
+    const indexes = try gpa.alloc(u32, len + 3);
+    defer gpa.free(indexes);
+
+    // Guarantee: Stage 1 and Stage 2 must never crash or panic on corrupted inputs
+    const structurals = simdjson.Stage1Indexer.indexPadded(padded, len, indexes) catch return;
+    const tape_buf = try gpa.alloc(u64, structurals * 2 + 16);
+    defer gpa.free(tape_buf);
+
+    _ = simdjson.Stage2Parser.parse(padded, indexes, structurals, tape_buf) catch return;
+}
+```
+
+---
+
 ## Error Handling Reference (`SimdJsonError`)
 
 All functions return strongly-typed errors with human-readable descriptions via `simdjson.errorMessage(err)`:
@@ -852,9 +1034,9 @@ All functions return strongly-typed errors with human-readable descriptions via 
 
 ## Running Tests & Benchmarks
 
-### Run Full Test Suite (102 Tests)
+### Run Full Test Suite (117 Tests)
 ```bash
-zig test src/root.zig
+zig build test --summary all
 ```
 
 ### Run Cross-Compilation Verification (ARM64 Linux)

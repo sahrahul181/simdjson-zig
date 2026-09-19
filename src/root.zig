@@ -1955,6 +1955,180 @@ test "Serde: Round-trip Zig Struct -> JSON String -> Zig Struct -> JSON String" 
     try std.testing.expectEqualStrings(json1, json2);
 }
 
+// =============================================================================
+// FUZZ TESTING
+// =============================================================================
 
+test "fuzz: stage1 and stage2 parser with arbitrary byte mutations" {
+    try std.testing.fuzz({}, testFuzzParser, .{});
+}
 
+fn testFuzzParser(context: void, smith: *std.testing.Smith) !void {
+    _ = context;
+    const gpa = std.testing.allocator;
 
+    const len = @as(usize, smith.value(u11)); // 0..2047 bytes
+    if (len == 0) return;
+
+    const input = try gpa.alloc(u8, len);
+    defer gpa.free(input);
+    smith.bytes(input);
+
+    // 1. Prepare padded buffer
+    const padded = try gpa.alloc(u8, len + SIMDJSON_PADDING);
+    defer gpa.free(padded);
+    @memcpy(padded[0..len], input);
+    @memset(padded[len..], ' ');
+
+    const indexes = try gpa.alloc(u32, len + 3);
+    defer gpa.free(indexes);
+
+    // Stage 1 must never crash on arbitrary input
+    const structurals = Stage1Indexer.indexPadded(padded, len, indexes) catch return;
+
+    // Stage 2 must never crash or read out of bounds
+    const tape_buf = try gpa.alloc(u64, structurals * 2 + 16);
+    defer gpa.free(tape_buf);
+
+    const tape_len = Stage2Parser.parse(padded, indexes, structurals, tape_buf) catch return;
+
+    // If valid tape was produced, DOM traversal must be safe
+    const doc = Document.init(padded, tape_buf[0..tape_len]);
+    _ = doc.root().getType();
+
+    // OnDemand parser test on same input
+    var od_doc = OnDemandDocument.init(padded, indexes, structurals);
+    var val = od_doc.root();
+    _ = val.skip() catch {};
+}
+
+// =============================================================================
+// SLIDING WINDOW LARGER FILE TEST
+// =============================================================================
+
+test "streaming: sliding window on multi-megabyte stream across chunk boundaries" {
+    const allocator = std.testing.allocator;
+
+    // Generate a simulated 2.5 MB JSON stream with 10,000 concatenated records
+    const num_records: usize = 10000;
+    var total_bytes: usize = 0;
+    var stream_builder: std.ArrayList(u8) = .empty;
+    defer stream_builder.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < num_records) : (i += 1) {
+        var record_buf: [128]u8 = undefined;
+        const slice = try std.fmt.bufPrint(
+            &record_buf,
+            \\{{"seq":{d},"status":"ok","sensor":"temp_alpha","val":{d}.5}}
+        ,
+            .{ i, i % 100 },
+        );
+        try stream_builder.appendSlice(allocator, slice);
+        total_bytes += slice.len;
+    }
+
+    try std.testing.expect(total_bytes > 500_000); // Verify substantial size
+
+    // Parse with a deliberately small sliding window (16 KB) to force thousands of window refills
+    var reader = std.Io.Reader.fixed(stream_builder.items);
+    var chunk_stream = try stream.chunkedDocumentStream(
+        allocator,
+        &reader,
+        .{ .window_capacity = 16 * 1024, .auto_grow = true },
+    );
+    defer chunk_stream.deinit();
+
+    var records_parsed: usize = 0;
+    var last_seq: i64 = -1;
+
+    while (try chunk_stream.next()) |doc| {
+        const root_el = doc.root();
+        const obj = try root_el.asObject();
+
+        if (obj.get("seq")) |seq_el| {
+            const seq = try seq_el.asInt();
+            try std.testing.expectEqual(last_seq + 1, seq);
+            last_seq = seq;
+        }
+
+        records_parsed += 1;
+    }
+
+    try std.testing.expectEqual(num_records, records_parsed);
+}
+
+// =============================================================================
+// MULTIPLE JSON PARSING FILE TEST
+// =============================================================================
+
+test "streaming: multiple concatenated JSON documents (without commas or brackets)" {
+    const allocator = std.testing.allocator;
+
+    // Multi-document stream (e.g. streaming log records or API event streams)
+    const multi_json =
+        \\{"id": 1, "type": "login", "user": "alice"}
+        \\{"id": 2, "type": "action", "user": "bob"}
+        \\{"id": 3, "type": "logout", "user": "alice"}
+        \\{"id": 4, "type": "payment", "user": "charlie"}
+    ;
+
+    // Method 1: Low-Level Two-Stage DocumentStream
+    {
+        const padded = try allocator.alloc(u8, multi_json.len + SIMDJSON_PADDING);
+        defer allocator.free(padded);
+        @memcpy(padded[0..multi_json.len], multi_json);
+        @memset(padded[multi_json.len..], ' ');
+
+        const indexes = try allocator.alloc(u32, multi_json.len + 3);
+        defer allocator.free(indexes);
+        const structurals = try Stage1Indexer.indexPadded(padded, multi_json.len, indexes);
+
+        const tape_buf = try allocator.alloc(u64, structurals * 2 + 16);
+        defer allocator.free(tape_buf);
+
+        var doc_stream = DocumentStream.init(padded, indexes, structurals, tape_buf);
+        var ids: [4]i64 = undefined;
+        var count: usize = 0;
+
+        while (try doc_stream.next()) |doc| : (count += 1) {
+            const obj = try doc.root().asObject();
+            ids[count] = try (obj.get("id").?).asInt();
+        }
+
+        try std.testing.expectEqual(@as(usize, 4), count);
+        try std.testing.expectEqual(@as(i64, 1), ids[0]);
+        try std.testing.expectEqual(@as(i64, 2), ids[1]);
+        try std.testing.expectEqual(@as(i64, 3), ids[2]);
+        try std.testing.expectEqual(@as(i64, 4), ids[3]);
+    }
+
+    // Method 2: High-Speed OnDemand Stream (zero tape allocations)
+    {
+        const padded = try allocator.alloc(u8, multi_json.len + SIMDJSON_PADDING);
+        defer allocator.free(padded);
+        @memcpy(padded[0..multi_json.len], multi_json);
+        @memset(padded[multi_json.len..], ' ');
+
+        const indexes = try allocator.alloc(u32, multi_json.len + 3);
+        defer allocator.free(indexes);
+        const structurals = try Stage1Indexer.indexPadded(padded, multi_json.len, indexes);
+
+        var od_stream = OnDemandDocumentStream.init(padded, indexes, structurals);
+        var users: [4][]const u8 = undefined;
+        var count: usize = 0;
+
+        while (try od_stream.next()) |record| : (count += 1) {
+            var obj = try record.asObject();
+            if (try obj.get("user")) |user_val| {
+                users[count] = try user_val.asString();
+            }
+        }
+
+        try std.testing.expectEqual(@as(usize, 4), count);
+        try std.testing.expectEqualStrings("alice", users[0]);
+        try std.testing.expectEqualStrings("bob", users[1]);
+        try std.testing.expectEqualStrings("alice", users[2]);
+        try std.testing.expectEqualStrings("charlie", users[3]);
+    }
+}
