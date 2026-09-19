@@ -34,7 +34,13 @@ test "JSONTestSuite official conformance test suite (318 tests)" {
             const tape_buf = try allocator.alloc(u64, structurals * 2 + 16);
             defer allocator.free(tape_buf);
 
-            _ = simdjson.Stage2Parser.parse(padded, indexes, structurals, tape_buf) catch break :blk false;
+            _ = simdjson.Stage2Parser.parseOptions(
+                .{ .validate_strings = true },
+                padded,
+                indexes,
+                structurals,
+                tape_buf,
+            ) catch break :blk false;
             break :blk true;
         };
 

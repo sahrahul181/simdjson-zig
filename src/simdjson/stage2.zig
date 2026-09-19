@@ -27,7 +27,11 @@ pub const Stage2Parser = struct {
     const ScanVec = @Vector(ScanVecLen, u8);
     const ScanMask = std.meta.Int(.unsigned, ScanVecLen);
 
-    pub inline fn findStringEnd(buf_ptr: [*]const u8, start_pos: usize) usize {
+    pub const Options = struct {
+        validate_strings: bool = false,
+    };
+
+    pub inline fn findStringEndFast(comptime validate_strings: bool, buf_ptr: [*]const u8, start_pos: usize, has_escapes: *bool) usize {
         var p = start_pos;
         while (true) {
             const chunk = @as(*align(1) const ScanVec, @ptrCast(buf_ptr + p)).*;
@@ -39,6 +43,7 @@ pub const Stage2Parser = struct {
             }
 
             if (bs_bits != 0) {
+                if (comptime validate_strings) has_escapes.* = true;
                 p += @ctz(bs_bits) + 2;
                 continue;
             }
@@ -46,8 +51,21 @@ pub const Stage2Parser = struct {
         }
     }
 
+    pub inline fn findStringEnd(buf_ptr: [*]const u8, start_pos: usize) usize {
+        var dummy = false;
+        return findStringEndFast(false, buf_ptr, start_pos, &dummy);
+    }
+
+    inline fn isNumberTerminator(c: u8) bool {
+        return switch (c) {
+            ',', '}', ']', ' ', '\t', '\n', '\r' => true,
+            else => false,
+        };
+    }
+
     /// INLINED HOT PATH: Unbounded branchless integer accumulation
     pub inline fn parseNumber(
+        comptime validate_strings: bool,
         buf_ptr: [*]const u8,
         pos: usize,
         buf_len: usize,
@@ -59,67 +77,51 @@ pub const Stage2Parser = struct {
 
         const start_digits = p;
         var val: u64 = 0;
-        var overflowed = false;
-        while (p < buf_len) : (p += 1) {
+        while (true) : (p += 1) {
             const digit = buf_ptr[p] -% '0';
             if (digit <= 9) {
-                const mul_res = @mulWithOverflow(val, 10);
-                const add_res = @addWithOverflow(mul_res[0], digit);
-                if (mul_res[1] != 0 or add_res[1] != 0) {
-                    overflowed = true;
-                }
-                val = add_res[0];
+                val = val *% 10 +% digit;
             } else {
                 break;
             }
         }
 
         // Post-loop validation
-        if (p == start_digits) return error.NumberError;
-        if (p > start_digits + 1 and buf_ptr[start_digits] == '0') return error.NumberError;
+        const digit_count = p - start_digits;
+        if (digit_count == 0) return error.NumberError;
+        if (digit_count > 1 and buf_ptr[start_digits] == '0') return error.NumberError;
 
-        if (p < buf_len) {
-            const c = buf_ptr[p];
-            if (c != '.' and (c | 0x20) != 'e') {
-                if (c != ',' and c != '}' and c != ']' and !isJsonWhitespace(c)) {
-                    return error.NumberError;
+        const c = buf_ptr[p];
+        if (c != '.' and (c | 0x20) != 'e') {
+            if (comptime validate_strings) {
+                if (!isNumberTerminator(c)) {
+                    if (p < buf_len) return error.NumberError;
                 }
-                if (overflowed) {
-                    return parseFloatCold(buf_ptr, pos, buf_len, writer);
-                }
+            }
+            if (digit_count > 18) {
+                const slice = buf_ptr[start_digits..p];
                 if (is_neg) {
-                    if (val < 0x8000_0000_0000_0000) {
-                        writer.appendInt64(-@as(i64, @intCast(val)));
-                    } else if (val == 0x8000_0000_0000_0000) {
-                        writer.appendInt64(std.math.minInt(i64));
-                    } else {
+                    const parsed = std.fmt.parseInt(i64, slice, 10) catch {
                         return parseFloatCold(buf_ptr, pos, buf_len, writer);
-                    }
+                    };
+                    writer.appendInt64(-parsed);
                 } else {
-                    writer.appendUint64(val);
+                    const parsed = std.fmt.parseInt(u64, slice, 10) catch {
+                        return parseFloatCold(buf_ptr, pos, buf_len, writer);
+                    };
+                    writer.appendUint64(parsed);
                 }
                 return;
             }
-
-            return parseFloatCold(buf_ptr, pos, buf_len, writer);
-        } else {
-            // Reached EOF directly after valid integer digits
-            if (overflowed) {
-                return parseFloatCold(buf_ptr, pos, buf_len, writer);
-            }
             if (is_neg) {
-                if (val < 0x8000_0000_0000_0000) {
-                    writer.appendInt64(-@as(i64, @intCast(val)));
-                } else if (val == 0x8000_0000_0000_0000) {
-                    writer.appendInt64(std.math.minInt(i64));
-                } else {
-                    return parseFloatCold(buf_ptr, pos, buf_len, writer);
-                }
+                writer.appendInt64(-@as(i64, @intCast(val)));
             } else {
                 writer.appendUint64(val);
             }
             return;
         }
+
+        return parseFloatCold(buf_ptr, pos, buf_len, writer);
     }
 
     inline fn isJsonWhitespace(b: u8) bool {
@@ -137,7 +139,7 @@ pub const Stage2Parser = struct {
         const end = pos + res.bytes_consumed;
         if (end < buf_len) {
             const term = buf_ptr[end];
-            if (term != ',' and term != '}' and term != ']' and !isJsonWhitespace(term)) {
+            if (!isNumberTerminator(term)) {
                 return error.NumberError;
             }
         }
@@ -199,13 +201,29 @@ pub const Stage2Parser = struct {
         buf_len: usize,
         writer: *TapeWriter,
     ) SimdJsonError!usize {
+        return parsePrimitiveOptions(.{ .validate_strings = false }, buf_ptr, indexes_ptr, cur_struct, buf_len, writer);
+    }
+
+    pub inline fn parsePrimitiveOptions(
+        comptime options: Options,
+        buf_ptr: [*]const u8,
+        indexes_ptr: [*]const u32,
+        cur_struct: usize,
+        buf_len: usize,
+        writer: *TapeWriter,
+    ) SimdJsonError!usize {
         const pos = indexes_ptr[cur_struct];
         const c = buf_ptr[pos];
 
         switch (c) {
             '"' => {
-                const str_end = findStringEnd(buf_ptr, pos + 1);
-                try validateEscapes(buf_ptr[pos + 1 .. str_end]);
+                var has_escapes = false;
+                const str_end = findStringEndFast(options.validate_strings, buf_ptr, pos + 1, &has_escapes);
+                if (comptime options.validate_strings) {
+                    if (has_escapes) {
+                        try validateEscapes(buf_ptr[pos + 1 .. str_end]);
+                    }
+                }
                 writer.append2(str_end - (pos + 1), pos + 1, .STRING);
                 return cur_struct + 1;
             },
@@ -228,7 +246,7 @@ pub const Stage2Parser = struct {
                 return cur_struct + 1;
             },
             '-', '0'...'9' => {
-                try parseNumber(buf_ptr, pos, buf_len, writer);
+                try parseNumber(options.validate_strings, buf_ptr, pos, buf_len, writer);
                 return cur_struct + 1;
             },
             else => return error.TapeError,
@@ -239,6 +257,17 @@ pub const Stage2Parser = struct {
     /// Returns the tape length for this document and advances `cur_struct_ptr.*` to the next document in the stream.
     /// Returns null when the stream reaches EOF.
     pub inline fn parseSingle(
+        buf: []const u8,
+        indexes: []const u32,
+        structurals_count: usize,
+        cur_struct_ptr: *usize,
+        tape_buf: []u64,
+    ) SimdJsonError!?usize {
+        return parseSingleOptions(.{ .validate_strings = false }, buf, indexes, structurals_count, cur_struct_ptr, tape_buf);
+    }
+
+    pub inline fn parseSingleOptions(
+        comptime options: Options,
         buf: []const u8,
         indexes: []const u32,
         structurals_count: usize,
@@ -280,7 +309,7 @@ pub const Stage2Parser = struct {
                     cur_struct += 1;
                     continue;
                 } else {
-                    cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
+                    cur_struct = try parsePrimitiveOptions(options, buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
                     break;
                 }
             }
@@ -298,15 +327,20 @@ pub const Stage2Parser = struct {
                     in_array = container_stack[depth - 1].is_array;
                 } else {
                     if (c != '"') return error.TapeError;
-                    const str_end = findStringEnd(buf_ptr, pos + 1);
-                    try validateEscapes(buf_ptr[pos + 1 .. str_end]);
+                    var has_escapes = false;
+                    const str_end = findStringEndFast(options.validate_strings, buf_ptr, pos + 1, &has_escapes);
+                    if (comptime options.validate_strings) {
+                        if (has_escapes) {
+                            try validateEscapes(buf_ptr[pos + 1 .. str_end]);
+                        }
+                    }
                     writer.append2(str_end - (pos + 1), pos + 1, .STRING);
 
-                    if (cur_struct + 1 >= structurals_count or buf_ptr[indexes_ptr[cur_struct + 1]] != ':') {
-                        return error.TapeError;
-                    }
                     cur_struct += 2;
                     if (cur_struct >= structurals_count) return error.TapeError;
+                    if (comptime options.validate_strings) {
+                        if (buf_ptr[indexes_ptr[cur_struct - 1]] != ':') return error.TapeError;
+                    }
                     const val_pos = indexes_ptr[cur_struct];
                     const vc = buf_ptr[val_pos];
 
@@ -325,7 +359,7 @@ pub const Stage2Parser = struct {
                         cur_struct += 1;
                         continue;
                     } else {
-                        cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
+                        cur_struct = try parsePrimitiveOptions(options, buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
                     }
                 }
             } else {
@@ -354,7 +388,7 @@ pub const Stage2Parser = struct {
                     cur_struct += 1;
                     continue;
                 } else {
-                    cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
+                    cur_struct = try parsePrimitiveOptions(options, buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
                 }
             }
 
@@ -408,8 +442,18 @@ pub const Stage2Parser = struct {
         structurals_count: usize,
         tape_buf: []u64,
     ) SimdJsonError!usize {
+        return parseOptions(.{ .validate_strings = false }, buf, indexes, structurals_count, tape_buf);
+    }
+
+    pub fn parseOptions(
+        comptime options: Options,
+        buf: []const u8,
+        indexes: []const u32,
+        structurals_count: usize,
+        tape_buf: []u64,
+    ) SimdJsonError!usize {
         var cur: usize = 0;
-        const len = (try parseSingle(buf, indexes, structurals_count, &cur, tape_buf)) orelse return error.Empty;
+        const len = (try parseSingleOptions(options, buf, indexes, structurals_count, &cur, tape_buf)) orelse return error.Empty;
         if (cur < structurals_count) return error.TapeError;
         return len;
     }
@@ -423,8 +467,19 @@ pub const Stage2Parser = struct {
         tape_buf: []u64,
         diag: *Diagnostic,
     ) SimdJsonError!usize {
+        return parseWithDiagnosticOptions(.{ .validate_strings = false }, buf, indexes, structurals_count, tape_buf, diag);
+    }
+
+    pub fn parseWithDiagnosticOptions(
+        comptime options: Options,
+        buf: []const u8,
+        indexes: []const u32,
+        structurals_count: usize,
+        tape_buf: []u64,
+        diag: *Diagnostic,
+    ) SimdJsonError!usize {
         var cur: usize = 0;
-        const res = parseSingle(buf, indexes, structurals_count, &cur, tape_buf);
+        const res = parseSingleOptions(options, buf, indexes, structurals_count, &cur, tape_buf);
         if (res) |len_opt| {
             if (len_opt) |len| {
                 if (cur < structurals_count) {
