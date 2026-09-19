@@ -5,3 +5,7 @@ zig-out/
 *.pdb
 /test-git-package/
 /simdjson/
+gharchive.json
+large_*.json
+*.gz
+*.tar

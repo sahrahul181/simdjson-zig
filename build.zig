@@ -40,6 +40,26 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the benchmark suite");
     bench_step.dependOn(&run_bench.step);
 
+    // Large dataset benchmark (200MB+ / 500MB+)
+    const bench_large_exe = b.addExecutable(.{
+        .name = "simdjson_bench_large",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_large.zig"),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = true,
+            .imports = &.{
+                .{ .name = "simdjson", .module = simdjson_mod },
+            },
+        }),
+    });
+    b.installArtifact(bench_large_exe);
+
+    const run_bench_large = b.addRunArtifact(bench_large_exe);
+    run_bench_large.step.dependOn(b.getInstallStep());
+    const bench_large_step = b.step("bench-large", "Run the large dataset (200MB+) benchmark");
+    bench_large_step.dependOn(&run_bench_large.step);
+
     // Unit & integration test suite
     const unit_tests = b.addTest(.{
         .root_module = simdjson_mod,
