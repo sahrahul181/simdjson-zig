@@ -50,6 +50,7 @@ pub const Stage2Parser = struct {
     pub inline fn parseNumber(
         buf_ptr: [*]const u8,
         pos: usize,
+        buf_len: usize,
         writer: *TapeWriter,
     ) SimdJsonError!void {
         var p = pos;
@@ -58,11 +59,16 @@ pub const Stage2Parser = struct {
 
         const start_digits = p;
         var val: u64 = 0;
-
-        while (true) : (p += 1) {
+        var overflowed = false;
+        while (p < buf_len) : (p += 1) {
             const digit = buf_ptr[p] -% '0';
             if (digit <= 9) {
-                val = val *% 10 +% digit;
+                const mul_res = @mulWithOverflow(val, 10);
+                const add_res = @addWithOverflow(mul_res[0], digit);
+                if (mul_res[1] != 0 or add_res[1] != 0) {
+                    overflowed = true;
+                }
+                val = add_res[0];
             } else {
                 break;
             }
@@ -72,38 +78,125 @@ pub const Stage2Parser = struct {
         if (p == start_digits) return error.NumberError;
         if (p > start_digits + 1 and buf_ptr[start_digits] == '0') return error.NumberError;
 
-        const c = buf_ptr[p];
-        if (c != '.' and (c | 0x20) != 'e') {
+        if (p < buf_len) {
+            const c = buf_ptr[p];
+            if (c != '.' and (c | 0x20) != 'e') {
+                if (c != ',' and c != '}' and c != ']' and !isJsonWhitespace(c)) {
+                    return error.NumberError;
+                }
+                if (overflowed) {
+                    return parseFloatCold(buf_ptr, pos, buf_len, writer);
+                }
+                if (is_neg) {
+                    if (val < 0x8000_0000_0000_0000) {
+                        writer.appendInt64(-@as(i64, @intCast(val)));
+                    } else if (val == 0x8000_0000_0000_0000) {
+                        writer.appendInt64(std.math.minInt(i64));
+                    } else {
+                        return parseFloatCold(buf_ptr, pos, buf_len, writer);
+                    }
+                } else {
+                    writer.appendUint64(val);
+                }
+                return;
+            }
+
+            return parseFloatCold(buf_ptr, pos, buf_len, writer);
+        } else {
+            // Reached EOF directly after valid integer digits
+            if (overflowed) {
+                return parseFloatCold(buf_ptr, pos, buf_len, writer);
+            }
             if (is_neg) {
-                writer.appendInt64(-@as(i64, @intCast(val)));
+                if (val < 0x8000_0000_0000_0000) {
+                    writer.appendInt64(-@as(i64, @intCast(val)));
+                } else if (val == 0x8000_0000_0000_0000) {
+                    writer.appendInt64(std.math.minInt(i64));
+                } else {
+                    return parseFloatCold(buf_ptr, pos, buf_len, writer);
+                }
             } else {
                 writer.appendUint64(val);
             }
             return;
         }
+    }
 
-        return parseFloatCold(buf_ptr, pos, writer);
+    inline fn isJsonWhitespace(b: u8) bool {
+        return b == ' ' or b == '\t' or b == '\n' or b == '\r';
     }
 
     /// COLD PATH: High-speed Lemire IEEE-754 decimal float parser
     fn parseFloatCold(
         buf_ptr: [*]const u8,
         pos: usize,
+        buf_len: usize,
         writer: *TapeWriter,
     ) SimdJsonError!void {
-        const res = fast_float.parseNumber(buf_ptr, pos, std.math.maxInt(usize)) catch return error.NumberError;
+        const res = fast_float.parseNumber(buf_ptr, pos, buf_len) catch return error.NumberError;
         const end = pos + res.bytes_consumed;
-        const term = buf_ptr[end];
-        if (term != ',' and term != '}' and term != ']' and term > ' ') {
-            return error.NumberError;
+        if (end < buf_len) {
+            const term = buf_ptr[end];
+            if (term != ',' and term != '}' and term != ']' and !isJsonWhitespace(term)) {
+                return error.NumberError;
+            }
         }
         writer.appendDouble(res.val);
+    }
+
+    pub fn validateEscapes(raw_str: []const u8) SimdJsonError!void {
+        if (std.mem.indexOfScalar(u8, raw_str, '\\') == null) return;
+
+        var i: usize = 0;
+        while (i < raw_str.len) {
+            if (raw_str[i] != '\\') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if (i >= raw_str.len) return error.StringError;
+            const esc = raw_str[i];
+            i += 1;
+            switch (esc) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => continue,
+                'u' => {
+                    if (i + 4 > raw_str.len) return error.StringError;
+                    const cp = decodeHex4(raw_str[i .. i + 4]) catch return error.StringError;
+                    i += 4;
+                    if (cp >= 0xD800 and cp <= 0xDBFF) {
+                        // High surrogate requires following low surrogate: \uDC00 - \uDFFF
+                        if (i + 6 > raw_str.len or raw_str[i] != '\\' or raw_str[i + 1] != 'u') {
+                            return error.StringError;
+                        }
+                        const low_cp = decodeHex4(raw_str[i + 2 .. i + 6]) catch return error.StringError;
+                        if (low_cp < 0xDC00 or low_cp > 0xDFFF) return error.StringError;
+                        i += 6;
+                    }
+                },
+                else => return error.StringError,
+            }
+        }
+    }
+
+    inline fn decodeHex4(slice: []const u8) !u16 {
+        var val: u16 = 0;
+        for (slice) |c| {
+            val <<= 4;
+            switch (c) {
+                '0'...'9' => val |= c - '0',
+                'a'...'f' => val |= c - 'a' + 10,
+                'A'...'F' => val |= c - 'A' + 10,
+                else => return error.StringError,
+            }
+        }
+        return val;
     }
 
     pub inline fn parsePrimitive(
         buf_ptr: [*]const u8,
         indexes_ptr: [*]const u32,
         cur_struct: usize,
+        buf_len: usize,
         writer: *TapeWriter,
     ) SimdJsonError!usize {
         const pos = indexes_ptr[cur_struct];
@@ -112,6 +205,7 @@ pub const Stage2Parser = struct {
         switch (c) {
             '"' => {
                 const str_end = findStringEnd(buf_ptr, pos + 1);
+                try validateEscapes(buf_ptr[pos + 1 .. str_end]);
                 writer.append2(str_end - (pos + 1), pos + 1, .STRING);
                 return cur_struct + 1;
             },
@@ -134,7 +228,7 @@ pub const Stage2Parser = struct {
                 return cur_struct + 1;
             },
             '-', '0'...'9' => {
-                try parseNumber(buf_ptr, pos, writer);
+                try parseNumber(buf_ptr, pos, buf_len, writer);
                 return cur_struct + 1;
             },
             else => return error.TapeError,
@@ -186,7 +280,7 @@ pub const Stage2Parser = struct {
                     cur_struct += 1;
                     continue;
                 } else {
-                    cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, &writer);
+                    cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
                     break;
                 }
             }
@@ -205,9 +299,14 @@ pub const Stage2Parser = struct {
                 } else {
                     if (c != '"') return error.TapeError;
                     const str_end = findStringEnd(buf_ptr, pos + 1);
+                    try validateEscapes(buf_ptr[pos + 1 .. str_end]);
                     writer.append2(str_end - (pos + 1), pos + 1, .STRING);
 
-                    cur_struct += 2; // Rapid jump past string and colon
+                    if (cur_struct + 1 >= structurals_count or buf_ptr[indexes_ptr[cur_struct + 1]] != ':') {
+                        return error.TapeError;
+                    }
+                    cur_struct += 2;
+                    if (cur_struct >= structurals_count) return error.TapeError;
                     const val_pos = indexes_ptr[cur_struct];
                     const vc = buf_ptr[val_pos];
 
@@ -226,7 +325,7 @@ pub const Stage2Parser = struct {
                         cur_struct += 1;
                         continue;
                     } else {
-                        cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, &writer);
+                        cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
                     }
                 }
             } else {
@@ -255,7 +354,7 @@ pub const Stage2Parser = struct {
                     cur_struct += 1;
                     continue;
                 } else {
-                    cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, &writer);
+                    cur_struct = try parsePrimitive(buf_ptr, indexes_ptr, cur_struct, buf.len, &writer);
                 }
             }
 
@@ -311,6 +410,7 @@ pub const Stage2Parser = struct {
     ) SimdJsonError!usize {
         var cur: usize = 0;
         const len = (try parseSingle(buf, indexes, structurals_count, &cur, tape_buf)) orelse return error.Empty;
+        if (cur < structurals_count) return error.TapeError;
         return len;
     }
 
@@ -326,8 +426,14 @@ pub const Stage2Parser = struct {
         var cur: usize = 0;
         const res = parseSingle(buf, indexes, structurals_count, &cur, tape_buf);
         if (res) |len_opt| {
-            if (len_opt) |len| return len;
-            diag.* = Diagnostic.compute(buf, buf.len, error.Empty);
+            if (len_opt) |len| {
+                if (cur < structurals_count) {
+                    diag.* = Diagnostic.compute(buf, indexes[cur], error.TapeError);
+                    return error.TapeError;
+                }
+                return len;
+            }
+            diag.* = Diagnostic.compute(buf, 0, error.Empty);
             return error.Empty;
         } else |err| {
             const byte_pos = if (cur < structurals_count)

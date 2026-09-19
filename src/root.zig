@@ -2132,3 +2132,11 @@ test "streaming: multiple concatenated JSON documents (without commas or bracket
         try std.testing.expectEqualStrings("charlie", users[3]);
     }
 }
+
+// =============================================================================
+// CONFORMANCE TEST SUITE (JSONTestSuite 318 tests)
+// =============================================================================
+test {
+    _ = @import("simdjson/conformance_test.zig");
+}
+

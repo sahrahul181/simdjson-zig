@@ -3,4 +3,5 @@ zig-out/
 *.exe
 *.obj
 *.pdb
-test-git-package/
+/test-git-package/
+/simdjson/
