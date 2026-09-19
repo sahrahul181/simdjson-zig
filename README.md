@@ -114,10 +114,9 @@ pub fn build(b: *std.Build) void {
 const std = @import("std");
 const simdjson = @import("simdjson");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    // In Zig 0.16, use `init.gpa` or `init.arena.allocator()`
+    const allocator = init.gpa;
 
     const raw_json =
         \\{
@@ -128,6 +127,31 @@ pub fn main() !void {
         \\}
     ;
 
+    // =========================================================================
+    // Option 1: Ultra-Fast Serde (1-Liner Direct Struct Mapping)
+    // =========================================================================
+    const Config = struct {
+        project: []const u8,
+        stars: u32,
+        tags: []const []const u8,
+        maintainer: struct {
+            name: []const u8,
+            verified: bool,
+        },
+    };
+
+    var parsed = try simdjson.parseFromSlice(Config, allocator, raw_json, .{});
+    defer parsed.deinit();
+
+    std.debug.print("Project: {s} ({d} stars), Maintainer: {s}\n", .{
+        parsed.value.project,
+        parsed.value.stars,
+        parsed.value.maintainer.name,
+    });
+
+    // =========================================================================
+    // Option 2: Low-Level Two-Stage SIMD DOM & RFC 9535 JSONPath
+    // =========================================================================
     // 1. Prepare buffer with 64-byte padding required for SIMD vector reads
     const padded = try allocator.alloc(u8, raw_json.len + simdjson.SIMDJSON_PADDING);
     defer allocator.free(padded);
@@ -139,8 +163,8 @@ pub fn main() !void {
     defer allocator.free(indexes);
     const structurals = try simdjson.Stage1Indexer.indexPadded(padded, raw_json.len, indexes);
 
-    // 3. Stage 2: Parse into 64-bit compact DOM tape (zero allocations)
-    const tape_buf = try allocator.alloc(u64, structurals + 4);
+    // 3. Stage 2: Parse into 64-bit compact DOM tape (requires capacity: structurals * 2 + 16)
+    const tape_buf = try allocator.alloc(u64, structurals * 2 + 16);
     defer allocator.free(tape_buf);
     const tape_len = try simdjson.Stage2Parser.parse(padded, indexes, structurals, tape_buf);
 
@@ -149,14 +173,14 @@ pub fn main() !void {
     const obj = try doc.root().asObject();
 
     if (obj.get("project")) |project| {
-        std.debug.print("Project: {s}\n", .{try project.asString()});
+        std.debug.print("DOM: Project = {s}\n", .{try project.asString()});
     }
 
     // 5. Query using RFC 9535 JSONPath
     const matches = try doc.jsonPath(allocator, "$.maintainer.name");
     defer allocator.free(matches);
     if (matches.len > 0) {
-        std.debug.print("Maintainer: {s}\n", .{try matches[0].asString()});
+        std.debug.print("JSONPath: Maintainer = {s}\n", .{try matches[0].asString()});
     }
 }
 ```
